@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    app.kubernetes.io/name: addon-operator
+  name: addon-operator-servicemonitor
+spec:
+  endpoints:
+  - interval: 10s
+    path: /metrics
+    port: http
+  - interval: 10s
+    path: /metrics
+    port: https
+    tlsConfig:
+      insecureSkipVerify: true
+  namespaceSelector:
+    matchNames:
+    - openshift-addon-operator
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: addon-operator

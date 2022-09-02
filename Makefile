@@ -117,6 +117,12 @@ opm:
 helm:
 	./mage dependency:helm
 
+kustomize:
+	./mage dependency:kustomize
+
+operator-sdk:
+	./mage dependency:operatorsdk
+
 ## Run go mod tidy in all go modules
 tidy:
 	@cd apis; go mod tidy
@@ -289,6 +295,11 @@ openshift-ci-test-build: \
 	@tail -n"+3" "config/deploy/addons.managed.openshift.io_addons.yaml" > "config/openshift/manifests/addons.crd.yaml";
 	@tail -n"+3" "config/deploy/addons.managed.openshift.io_addonoperators.yaml" > "config/openshift/manifests/addonoperators.crd.yaml";
 	@tail -n"+3" "config/deploy/addons.managed.openshift.io_addoninstances.yaml" > "config/openshift/manifests/addoninstances.crd.yaml";
+
+openshift-ci-test-build_new: operator-sdk kustomize
+	cd config/openshift_new/release-artifacts; \
+	kustomize build ../manifests | \
+	operator-sdk generate bundle --channels stable --default-channel stable --kustomize-dir manifests --overwrite --package addon-operator --version 1.4.1
 
 .SECONDEXPANSION:
 

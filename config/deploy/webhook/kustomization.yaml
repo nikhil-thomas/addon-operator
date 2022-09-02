@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - 00-tls-secret.yaml
+  - service.yaml
+  - validatingwebhookconfig.yaml

@@ -6,8 +6,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
+	gourl "net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -15,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"archive/tar"
+	"compress/gzip"
 	"github.com/blang/semver/v4"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/stdr"
@@ -24,6 +28,7 @@ import (
 	"github.com/mt-sre/devkube/magedeps"
 	olmversion "github.com/operator-framework/api/pkg/lib/version"
 	operatorsv1alpha1 "github.com/operator-framework/api/pkg/operators/v1alpha1"
+
 	appsv1 "k8s.io/api/apps/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -114,6 +119,50 @@ func Prepare_Release() error {
 	// run generators to re-template config/openshift/manifests/*
 	if err := sh.RunV("make", "openshift-ci-test-build"); err != nil {
 		return fmt.Errorf("rebuilding config/openshift/: %w", err)
+	}
+	return nil
+}
+
+//New_Prepare_Release prepares the latest release of the Addon Operator
+func New_Prepare_Release() error {
+	versionBytes, err := ioutil.ReadFile(path.Join(workDir, "VERSION"))
+	if err != nil {
+		return fmt.Errorf("reading VERSION file: %w", err)
+	}
+
+	version = strings.TrimSpace(strings.TrimLeft(string(versionBytes), "v"))
+
+	// generate operator bundle
+	if err := sh.RunV("make", "openshift-ci-test-build_new"); err != nil {
+		return fmt.Errorf("rebuilding config/openshift/: %w", err)
+	}
+	return setSkipRange(version)
+}
+
+func setSkipRange(version string) error {
+	// read CSV
+	csvFilePath := "config/openshift_new/release-artifacts/bundle/manifests/addon-operator.clusterserviceversion.yaml"
+	csvFile, err := ioutil.ReadFile(path.Join(workDir, csvFilePath))
+	if err != nil {
+		return fmt.Errorf("reading CSV file: %w", err)
+	}
+
+	var csv operatorsv1alpha1.ClusterServiceVersion
+	if err := yaml.Unmarshal(csvFile, &csv); err != nil {
+		return err
+	}
+
+	// Update for new release
+	csv.Annotations["olm.skipRange"] = ">=0.0.1 <" + version
+	// csv metadata.name and spec.version are set by 'operator-sdk generate bundle' command
+
+	csvBytes, err := yaml.Marshal(csv)
+	if err != nil {
+		return err
+	}
+	if err := ioutil.WriteFile(csvFilePath,
+		csvBytes, os.ModePerm); err != nil {
+		return err
 	}
 	return nil
 }
@@ -563,17 +612,138 @@ func (Test) IntegrationShort() error {
 // Dependencies
 // ------------
 
+type toolName string
+type platform string
+type releaseBinaryURLs map[platform]string
+
 // Dependency Versions
+
 const (
-	controllerGenVersion = "0.6.2"
-	kindVersion          = "0.11.1"
-	yqVersion            = "4.12.0"
-	goimportsVersion     = "0.1.5"
-	golangciLintVersion  = "1.46.2"
-	olmVersion           = "0.20.0"
-	opmVersion           = "1.24.0"
-	helmVersion          = "3.7.2"
+	toolControllerGen toolName = "controller-gen"
+	toolKind                   = "kind"
+	toolYq                     = "yq"
+	toolGoImports              = "go-imports"
+	toolGolangciLint           = "golangci-lint"
+	toolHelm                   = "helm"
+	toolOpm                    = "opm"
+	toolKustomize              = "kustomize"
+	toolOperatorSDK            = "operator-sdk"
+
+	platformLinuxAMD64  platform = "linux/amd64"
+	platformDarwinAMD64          = "darwin/amd64"
+
+	olmVersion string = "0.20.0"
 )
+
+type dependency struct {
+	name    toolName
+	version string
+}
+
+type goGettableDependency struct {
+	dependency
+	url string
+}
+
+type releaseBinaryDependency struct {
+	dependency
+	platformURLs releaseBinaryURLs
+}
+
+func (rbd *releaseBinaryDependency) url() string {
+	osArch := platform(osAndArch())
+	url, ok := rbd.platformURLs[osArch]
+	if !ok {
+		panic(fmt.Errorf("not supported download url found for tool: %q, platform: %q", rbd.name, osArch))
+	}
+	return url
+}
+
+func osAndArch() string {
+	osArch := strings.Builder{}
+	osArch.WriteString(goruntime.GOOS)
+	osArch.WriteString("/")
+	osArch.WriteString(goruntime.GOARCH)
+	return osArch.String()
+}
+
+var goGettableDepencencies = map[toolName]goGettableDependency{
+	toolControllerGen: {
+		dependency{
+			name:    toolControllerGen,
+			version: "0.6.2",
+		},
+		"sigs.k8s.io/controller-tools/cmd/controller-gen",
+	},
+	toolKind: {
+		dependency{
+			name:    toolKind,
+			version: "0.11.1",
+		},
+		"sigs.k8s.io/kind",
+	},
+	toolYq: {
+		dependency{
+			name:    toolYq,
+			version: "4.12.0",
+		},
+		"github.com/mikefarah/yq/v4",
+	},
+	toolGoImports: {
+		dependency{
+			name:    toolGoImports,
+			version: ".1.5",
+		},
+		"golang.org/x/tools/cmd/goimports",
+	},
+	toolGolangciLint: {
+		dependency{
+			name:    toolGolangciLint,
+			version: "1.46.2",
+		},
+		"github.com/golangci/golangci-lint/cmd/golangci-lint",
+	},
+	toolHelm: {
+		dependency{
+			name:    toolHelm,
+			version: "3.7.2",
+		},
+		"helm.sh/helm/v3/cmd/helm",
+	},
+}
+
+var releaseBinaryDependencies = map[toolName]releaseBinaryDependency{
+	toolOpm: releaseBinaryDependency{
+		dependency{
+			name:    toolOpm,
+			version: "1.24.0",
+		},
+		releaseBinaryURLs{
+			platformLinuxAMD64:  "https://github.com/operator-framework/operator-registry/releases/download/v%s/linux-amd64-opm",
+			platformDarwinAMD64: "https://github.com/operator-framework/operator-registry/releases/download/v%s/darwin-amd64-opm",
+		},
+	},
+	toolKustomize: releaseBinaryDependency{
+		dependency{
+			name:    toolKustomize,
+			version: "4.5.7",
+		},
+		releaseBinaryURLs{
+			platformLinuxAMD64:  "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv%s/kustomize_v%s_linux_amd64.tar.gz",
+			platformDarwinAMD64: "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv%s/kustomize_v%s_darwin_amd64.tar.gz",
+		},
+	},
+	toolOperatorSDK: releaseBinaryDependency{
+		dependency{
+			name:    toolOperatorSDK,
+			version: "1.23.0",
+		},
+		releaseBinaryURLs{
+			platformLinuxAMD64:  "https://github.com/operator-framework/operator-sdk/releases/download/v%s/operator-sdk_linux_amd64",
+			platformDarwinAMD64: "https://github.com/operator-framework/operator-sdk/releases/download/v%s/operator-sdk_darwin_amd64",
+		},
+	},
+}
 
 type Dependency mg.Namespace
 
@@ -591,43 +761,83 @@ func (d Dependency) All() {
 
 // Ensure Kind dependency - Kubernetes in Docker (or Podman)
 func (d Dependency) Kind() error {
-	return depsDir.GoInstall("kind",
-		"sigs.k8s.io/kind", kindVersion)
+	toolConfig := goGettableDepencencies[toolKind]
+	return depsDir.GoInstall(
+		string(toolConfig.name),
+		toolConfig.url, toolConfig.version)
 }
 
 // Ensure controller-gen - kubebuilder code and manifest generator.
 func (d Dependency) ControllerGen() error {
-	return depsDir.GoInstall("controller-gen",
-		"sigs.k8s.io/controller-tools/cmd/controller-gen", controllerGenVersion)
+	toolConfig := goGettableDepencencies[toolControllerGen]
+	return depsDir.GoInstall(
+		string(toolConfig.name),
+		toolConfig.url, toolConfig.version)
 }
 
 // Ensure yq - jq but for Yaml, written in Go.
 func (d Dependency) YQ() error {
-	return depsDir.GoInstall("yq",
-		"github.com/mikefarah/yq/v4", yqVersion)
+	toolConfig := goGettableDepencencies[toolYq]
+	return depsDir.GoInstall(
+		string(toolConfig.name),
+		toolConfig.url, toolConfig.version)
 }
 
 func (d Dependency) Goimports() error {
-	return depsDir.GoInstall("go-imports",
-		"golang.org/x/tools/cmd/goimports", goimportsVersion)
+	toolConfig := goGettableDepencencies[toolGoImports]
+	return depsDir.GoInstall(
+		string(toolConfig.name),
+		toolConfig.url, toolConfig.version)
 }
 
 func (d Dependency) GolangciLint() error {
-	return depsDir.GoInstall("golangci-lint",
-		"github.com/golangci/golangci-lint/cmd/golangci-lint", golangciLintVersion)
+	toolConfig := goGettableDepencencies[toolGolangciLint]
+	return depsDir.GoInstall(
+		string(toolConfig.name),
+		toolConfig.url, toolConfig.version)
 }
 
 func (d Dependency) Helm() error {
-	return depsDir.GoInstall("helm", "helm.sh/helm/v3/cmd/helm", helmVersion)
+	toolConfig := goGettableDepencencies[toolHelm]
+	return depsDir.GoInstall(
+		string(toolConfig.name),
+		toolConfig.url, toolConfig.version)
 }
 
 func (d Dependency) Opm() error {
+	toolConfig := releaseBinaryDependencies[toolOpm]
+	return downloadReleaseBinary(
+		string(toolConfig.name),
+		toolConfig.version,
+		toolConfig.url(),
+	)
+}
+
+func (d Dependency) Kustomize() error {
+	toolConfig := releaseBinaryDependencies[toolKustomize]
+	return downloadReleaseBinary(
+		string(toolConfig.name),
+		toolConfig.version,
+		toolConfig.url(),
+	)
+}
+
+func (d Dependency) OperatorSDK() error {
+	toolConfig := releaseBinaryDependencies[toolOperatorSDK]
+	return downloadReleaseBinary(
+		string(toolConfig.name),
+		toolConfig.version,
+		toolConfig.url(),
+	)
+}
+
+func downloadReleaseBinary(toolName, toolVersion, url string) error {
 	// TODO: move this into devkube library, to ensure the depsDir is present, even if you just call "NeedsRebuild"
 	if err := os.MkdirAll(depsDir.Bin(), os.ModePerm); err != nil {
 		return fmt.Errorf("create dependency dir: %w", err)
 	}
 
-	needsRebuild, err := depsDir.NeedsRebuild("opm", opmVersion)
+	needsRebuild, err := depsDir.NeedsRebuild(toolName, toolVersion)
 	if err != nil {
 		return err
 	}
@@ -643,27 +853,80 @@ func (d Dependency) Opm() error {
 	defer os.RemoveAll(tempDir)
 
 	// Download
-	tempOPMBin := path.Join(tempDir, "opm")
+	urlObj, err := gourl.Parse(strings.ReplaceAll(url, "%s", toolVersion))
+	if err != nil {
+		return err
+	}
+	u := urlObj.Path
+	resourceName := u[strings.LastIndex(u, "/")+1:]
+	tempToolBin := path.Join(tempDir, resourceName)
 	if err := sh.RunV(
 		"curl", "-L", "--fail",
-		"-o", tempOPMBin,
-		fmt.Sprintf(
-			"https://github.com/operator-framework/operator-registry/releases/download/v%s/linux-amd64-opm",
-			opmVersion,
-		),
+		"-o", tempToolBin,
+		urlObj.String(),
 	); err != nil {
-		return fmt.Errorf("downloading opm: %w", err)
+		return fmt.Errorf("downloading %q: %w", toolName, err)
 	}
 
-	if err := os.Chmod(tempOPMBin, 0755); err != nil {
-		return fmt.Errorf("make opm executable: %w", err)
-	}
+	err = setupTool(tempToolBin, toolName)
+	return nil
+}
 
-	// Move
-	if err := os.Rename(tempOPMBin, path.Join(depsDir.Bin(), "opm")); err != nil {
-		return fmt.Errorf("move opm: %w", err)
+func setupTool(src, toolName string) error {
+	resourceName := src[strings.LastIndex(src, "/")+1:]
+	toolDestination := path.Join(depsDir.Bin(), toolName)
+
+	if strings.HasSuffix(resourceName, ".tar.gz") {
+		if err := extractArchive(src, toolDestination); err != nil {
+			return err
+		}
+	} else {
+		// Move
+		if err := os.Rename(src, toolDestination); err != nil {
+			return fmt.Errorf("move %s: %w", toolName, err)
+		}
+	}
+	if err := os.Chmod(toolDestination, 0755); err != nil {
+		return fmt.Errorf("make %s executable: %w", toolName, err)
 	}
 	return nil
+}
+
+func extractArchive(src, dst string) error {
+	toolName := dst[strings.LastIndex(dst, "/")+1:]
+	file, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	fileReader, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer fileReader.Close()
+	tarBallReader := tar.NewReader(fileReader)
+	for {
+		header, err := tarBallReader.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if header.Typeflag == tar.TypeReg && header.Name == toolName {
+			writer, err := os.Create(dst)
+			if err != nil {
+				return err
+			}
+
+			io.Copy(writer, tarBallReader)
+			err = os.Chmod(dst, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			writer.Close()
+		}
+	}
+	return fmt.Errorf("tool %q not found in archive", toolName)
 }
 
 // Development
