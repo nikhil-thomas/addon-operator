@@ -6,6 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 
 	"github.com/openshift/addon-operator/internal/controllers"
@@ -210,8 +213,17 @@ func (r *AddonReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			IsController: false, // We don't "control" the source secret, so we are only adding ourselves as owner/watcher
 		}).
 		Watches(&source.Kind{
-			Type: &operatorsv1alpha1.ClusterServiceVersion{},
-		}, r.csvEventHandler, builder.OnlyMetadata).
+			Type: &operatorsv1.Operator{},
+		}, handler.EnqueueRequestsFromMapFunc(func(client.Object) []reconcile.Request {
+			return []reconcile.Request{
+				reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: "",
+						Name:      "reference-addon",
+					},
+				},
+			}
+		}), builder.OnlyMetadata).
 		Watches(&source.Channel{ // Requeue everything when entering/leaving global pause.
 			Source: r.addonRequeueCh,
 		}, &handler.EnqueueRequestForObject{}).
